@@ -51,6 +51,7 @@ use parameters::SystemCallResultExecution;
 use perfect_derive::perfect_derive;
 use tezos_smart_rollup_constants::riscv::SBI_FIRMWARE_TEZOS;
 
+use self::addr::PageAligned;
 use self::addr::VirtAddr;
 use self::error::Error;
 use self::memory::STACK_SIZE;
@@ -62,8 +63,8 @@ use crate::machine_state::ProgramCounterUpdate;
 use crate::machine_state::memory::Address;
 use crate::machine_state::memory::Memory;
 use crate::machine_state::memory::MemoryConfig;
-use crate::machine_state::memory::PAGE_SIZE;
 use crate::machine_state::memory::Permissions;
+use crate::machine_state::memory::PAGE_SIZE;
 use crate::machine_state::page_cache::PageCache;
 use crate::machine_state::registers;
 use crate::program::Program;
@@ -460,9 +461,88 @@ pub struct SupervisorState<M: Mode> {
 
     /// Stack guard
     stack_guard: Atom<Range<VirtAddr>, M>,
+
+    /// Where a Linux `ecall` resumes. Zero means this supervisor still
+    /// performs the call. Unikraft sets it so a program it loaded enters
+    /// Unikraft instead of the host.
+    ecall_handler: Atom<u64, M>,
 }
 
+/// Unikraft platform services, carried as function ids of [`SBI_FIRMWARE_TEZOS`].
+/// These stay with the host because the guest cannot perform them. They do not
+/// overlap the Tezos function ids in `tezos_smart_rollup_constants`.
+const SBI_UK_CONSOLE: u64 = 0x20;
+const SBI_UK_HALT: u64 = 0x21;
+const SBI_UK_GETRANDOM: u64 = 0x22;
+const SBI_UK_MPROTECT: u64 = 0x23;
+const SBI_UK_SET_ECALL: u64 = 0x24;
+
 impl<M: Mode> SupervisorState<M> {
+    /// Host side of a Unikraft platform call. `None` leaves the function to the
+    /// Tezos handler.
+    fn handle_platform_sbi<MC, PC>(
+        &mut self,
+        machine: &mut MachineState<MC, PC, M>,
+        hooks: impl PvmHooks,
+        pc: u64,
+        function: u64,
+    ) -> Option<ControlFlow<()>>
+    where
+        MC: MemoryConfig,
+        PC: PageCache<MC, M>,
+        M: AtomMode + DataSpaceMode + VectorMode,
+    {
+        let a0 = machine.core.hart.xregisters.read(registers::a0);
+        let a1 = machine.core.hart.xregisters.read(registers::a1);
+        let a2 = machine.core.hart.xregisters.read(registers::a2);
+        let result = match function {
+            SBI_UK_CONSOLE => {
+                let fd = parameters::FileDescriptorWriteable::try_from(a0);
+                let buf = VirtAddr::new(a1);
+                Some(fd.and_then(|fd| self.handle_write(&mut machine.core, hooks, fd, buf, a2)))
+            }
+            SBI_UK_GETRANDOM => Some(self.handle_getrandom(&mut machine.core, a0, a1)),
+            SBI_UK_MPROTECT => {
+                let addr = PageAligned::<VirtAddr>::try_from(a0);
+                let prot = Permissions::try_from(a2);
+                Some(addr.and_then(|addr| {
+                    prot.and_then(|prot| self.handle_mprotect(machine, addr, a1, prot))
+                }))
+            }
+            SBI_UK_SET_ECALL => {
+                self.ecall_handler.write(a0);
+                Some(Ok(0))
+            }
+            SBI_UK_HALT => {
+                self.exit_code = a0;
+                self.exited = true;
+                machine.core.hart.xregisters.write(registers::a0, a0);
+                machine
+                    .core
+                    .update_pc(pc, ProgramCounterUpdate::Next(ECALL_WIDTH));
+                return Some(ControlFlow::Break(()));
+            }
+            _ => None,
+        }?;
+
+        match result {
+            Ok(value) => {
+                machine.core.hart.xregisters.write(registers::a0, value);
+            }
+            Err(error) => {
+                machine
+                    .core
+                    .hart
+                    .xregisters
+                    .write_system_call_error(error);
+            }
+        }
+        machine
+            .core
+            .update_pc(pc, ProgramCounterUpdate::Next(ECALL_WIDTH));
+        Some(ControlFlow::Continue(()))
+    }
+
     /// Handle a Linux system call.
     pub fn handle_system_call<MC, PC>(
         &mut self,
@@ -685,6 +765,19 @@ impl<M: Mode> SupervisorState<M> {
         // Programs targeting a Linux kernel pass the system call number in register a7
         let system_call_no = machine.core.hart.xregisters.read(registers::a7);
 
+        // Hypervisor calls stay here. Every other ecall belongs to the guest
+        // once it has registered a handler.
+        let handler = self.ecall_handler.read();
+        if handler != 0 && system_call_no != SBI_FIRMWARE_TEZOS {
+            machine
+                .core
+                .hart
+                .xregisters
+                .write(registers::ra, pc.wrapping_add(4));
+            machine.core.hart.pc.write(handler);
+            return ControlFlow::Continue(());
+        }
+
         let result = match system_call_no {
             GETCWD => dispatch2!(getcwd, &mut machine.core),
             IOCTL => dispatch2!(ioctl),
@@ -717,7 +810,13 @@ impl<M: Mode> SupervisorState<M> {
             SCHED_GETAFFINITY => dispatch3!(sched_getaffinity, &mut machine.core),
             GETTIMEOFDAY => dispatch2!(gettimeofday, &mut machine.core),
             PRLIMIT64 => dispatch4!(prlimit64, &mut machine.core),
-            SBI_FIRMWARE_TEZOS => return on_tezos(&mut machine.core),
+            SBI_FIRMWARE_TEZOS => {
+                let function = machine.core.hart.xregisters.read(registers::a6);
+                if let Some(flow) = self.handle_platform_sbi(machine, hooks, pc, function) {
+                    return flow;
+                }
+                return on_tezos(&mut machine.core);
+            }
             _ => Err(Error::NoSystemCall),
         };
 
@@ -1013,6 +1112,7 @@ impl<'normal> Provable<'normal> for SupervisorState<Normal> {
             program: self.program.start_proof(),
             heap: self.heap.start_proof(),
             stack_guard: self.stack_guard.start_proof(),
+            ecall_handler: self.ecall_handler.start_proof(),
         }
     }
 }
@@ -1026,6 +1126,7 @@ impl<M: CloneAtomMode> CloneState for SupervisorState<M> {
             program: self.program.clone_state(),
             heap: self.heap.clone_state(),
             stack_guard: self.stack_guard.clone_state(),
+            ecall_handler: self.ecall_handler.clone_state(),
         }
     }
 }
@@ -1036,6 +1137,7 @@ where
     F: Fold,
     Atom<VirtAddr, M>: Foldable<F>,
     Atom<Range<VirtAddr>, M>: Foldable<F>,
+    Atom<u64, M>: Foldable<F>,
 {
     fn fold(&self, builder: F) -> F::Folded {
         let mut builder = builder.into_node_fold();
@@ -1043,6 +1145,7 @@ where
         builder.add(&self.program);
         builder.add(&self.heap);
         builder.add(&self.stack_guard);
+        builder.add(&self.ecall_handler);
         builder.done()
     }
 }
@@ -1055,6 +1158,7 @@ impl Unfoldable for SupervisorState<Normal> {
         let program = src.next_branch()?;
         let heap = src.next_branch()?;
         let stack_guard = src.next_branch()?;
+        let ecall_handler = src.next_branch()?;
 
         src.done(Self {
             tid_address,
@@ -1063,6 +1167,7 @@ impl Unfoldable for SupervisorState<Normal> {
             program,
             heap,
             stack_guard,
+            ecall_handler,
         })
     }
 }
@@ -1075,6 +1180,7 @@ impl FromProof for SupervisorState<Verify> {
         let (proof, program) = proof.next_branch()?;
         let (proof, heap) = proof.next_branch()?;
         let (proof, stack_guard) = proof.next_branch()?;
+        let (proof, ecall_handler) = proof.next_branch()?;
 
         proof.done(Self {
             tid_address,
@@ -1083,6 +1189,7 @@ impl FromProof for SupervisorState<Verify> {
             program,
             heap,
             stack_guard,
+            ecall_handler,
         })
     }
 }
@@ -1093,6 +1200,7 @@ impl<M: EncodeAtomMode> Encode for SupervisorState<M> {
         self.program.encode(encoder)?;
         self.heap.encode(encoder)?;
         self.stack_guard.encode(encoder)?;
+        self.ecall_handler.encode(encoder)?;
         Ok(())
     }
 }
@@ -1106,6 +1214,7 @@ impl<C> Decode<C> for SupervisorState<Normal> {
             program: Decode::decode(decoder)?,
             heap: Decode::decode(decoder)?,
             stack_guard: Decode::decode(decoder)?,
+            ecall_handler: Decode::decode(decoder)?,
         })
     }
 }

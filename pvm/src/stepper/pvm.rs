@@ -204,6 +204,21 @@ impl<H, MC: MemoryConfig, PC: PageCache<MC, Normal>, DS: DurableStorage<Normal>>
         let proof_stepper = self.start_proof_mode();
         proof_stepper.pvm.produce_outbox_proof(output_info)
     }
+
+    /// Messages posted to the outbox, ordered by level then index.
+    pub fn outbox_messages(&self) -> Vec<(u32, Vec<Vec<u8>>)> {
+        self.pvm.tezos.outbox.recorded()
+    }
+
+    /// Feed one inbox message while the guest is waiting for input.
+    pub fn provide_inbox_message(&mut self, level: u32, counter: u32, payload: &[u8]) -> bool {
+        self.pvm.provide_inbox_message(level, counter, payload)
+    }
+
+    /// Current PVM status.
+    pub fn pvm_status(&self) -> crate::pvm::PvmStatus {
+        self.pvm.status()
+    }
 }
 
 impl<

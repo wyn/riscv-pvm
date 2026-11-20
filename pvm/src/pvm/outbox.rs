@@ -193,6 +193,24 @@ impl<M: AtomMode + VectorMode> Outbox<M> {
 }
 
 impl Outbox<Normal> {
+    /// Messages still stored, ordered by level then by the order they were posted.
+    pub(crate) fn recorded(&self) -> Vec<(u32, Vec<Vec<u8>>)> {
+        let mut found = Vec::new();
+        for slot in self.levels.iter() {
+            if slot.messages.is_empty() {
+                continue;
+            }
+            let messages = slot
+                .messages
+                .iter()
+                .map(|message| message.deref().deref().to_vec())
+                .collect();
+            found.push((slot.level.read(), messages));
+        }
+        found.sort_by_key(|(level, _)| *level);
+        found
+    }
+
     /// Read outbox messages at the given level
     ///
     /// Warning: The caller must ensure that `level` is within the outbox
